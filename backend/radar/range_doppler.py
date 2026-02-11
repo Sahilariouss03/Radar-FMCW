@@ -1,11 +1,10 @@
 """
-Range-Doppler Processing Module
+Range-Doppler Processing Module — Physics-Correct Implementation
 
-Implements 2D FFT-based Range-Doppler map generation:
-- Fast-time FFT for range compression
-- Slow-time FFT for Doppler processing
-- Axis generation (range in meters, velocity in m/s)
-- Magnitude map computation
+Range axis:     R[i]  = i · ΔR,  ΔR = c / (2B)
+Doppler axis:   f_d[k] = fftfreq(M, T_PRI)  then fftshift
+Velocity axis:  v[k]  = (λ/2) · f_d[k]
+Max velocity:   v_max = λ / (4·T_PRI)
 """
 
 import numpy as np
@@ -13,21 +12,12 @@ from typing import Tuple, Dict
 
 
 class RangeDopplerProcessor:
-    """Range-Doppler Map Generator"""
-    
+    """Range-Doppler Map Generator (Physics-Correct)"""
+
     def __init__(self, radar_config: Dict):
         """
-        Initialize Range-Doppler processor.
-        
         Args:
-            radar_config: Dictionary containing:
-                - fc: Carrier frequency (Hz)
-                - B: Bandwidth (Hz)
-                - Tsw: Sweep time (s)
-                - PRI: Pulse Repetition Interval (s)
-                - N: ADC samples per chirp
-                - M: Number of chirps
-                - c: Speed of light (m/s)
+            radar_config: dict with keys fc, B, Tsw, PRI, N, M, c (optional)
         """
         self.fc = radar_config['fc']
         self.B = radar_config['B']
@@ -36,11 +26,15 @@ class RangeDopplerProcessor:
         self.N = radar_config['N']
         self.M = radar_config['M']
         self.c = radar_config.get('c', 3e8)
-        
-        # Derived parameters
-        self.fs = self.N / self.Tsw
-        self.chirp_rate = self.B / self.Tsw
-        
+
+        # Derived
+        self.lambda_ = self.c / self.fc
+        self.Ts = self.Tsw / self.N
+        self.fs = 1.0 / self.Ts
+        self.range_resolution = self.c / (2 * self.B)           # ΔR
+        self.max_velocity = self.lambda_ / (4 * self.PRI)       # v_max
+
+    # ------------------------------------------------------------------
     def compute_range_doppler(
         self,
         beat_signal: np.ndarray,
@@ -48,84 +42,95 @@ class RangeDopplerProcessor:
         window_doppler: str = 'hann'
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Compute Range-Doppler map using 2D FFT.
-        
-        Args:
-            beat_signal: Complex beat signal [M, N]
-            window_range: Window function for range FFT ('hann', 'hamming', 'blackman', None)
-            window_doppler: Window function for Doppler FFT
-            
+        Compute Range-Doppler map via 2-D FFT.
+
         Returns:
-            rd_map: Range-Doppler magnitude map [M, N] (dB scale)
-            range_axis: Range values (m)
-            velocity_axis: Velocity values (m/s)
+            rd_map_db:      [M, N] magnitude in dB
+            range_axis:     [N] in metres
+            velocity_axis:  [M] in m/s (centred around 0)
         """
         M, N = beat_signal.shape
-        
-        # Apply range window
+
+        # --- Apply range window (fast-time) ---
         if window_range:
-            range_window = self._get_window(window_range, N)
-            beat_signal = beat_signal * range_window[np.newaxis, :]
-        
-        # Range FFT (fast-time)
+            w_r = self._get_window(window_range, N)
+            beat_signal = beat_signal * w_r[np.newaxis, :]
+
+        # Range FFT (fast-time, axis=1)
         range_fft = np.fft.fft(beat_signal, axis=1)
-        
-        # Apply Doppler window
+
+        # --- Apply Doppler window (slow-time) ---
         if window_doppler:
-            doppler_window = self._get_window(window_doppler, M)
-            range_fft = range_fft * doppler_window[:, np.newaxis]
-        
-        # Doppler FFT (slow-time)
+            w_d = self._get_window(window_doppler, M)
+            range_fft = range_fft * w_d[:, np.newaxis]
+
+        # Doppler FFT (slow-time, axis=0) + fftshift to centre zero-Doppler
         rd_complex = np.fft.fftshift(np.fft.fft(range_fft, axis=0), axes=0)
-        
+
         # Magnitude in dB
-        rd_magnitude = np.abs(rd_complex)
-        rd_map = 20 * np.log10(rd_magnitude + 1e-12)  # Add small value to avoid log(0)
-        
-        # Generate axes
+        rd_mag = np.abs(rd_complex)
+        rd_map_db = 20 * np.log10(rd_mag + 1e-12)
+
+        # Axes
         range_axis = self._generate_range_axis()
         velocity_axis = self._generate_velocity_axis()
-        
-        return rd_map, range_axis, velocity_axis
-    
+
+        return rd_map_db, range_axis, velocity_axis
+
+    # ------------------------------------------------------------------
+    def compute_range_doppler_complex(
+        self,
+        beat_signal: np.ndarray,
+        window_range: str = 'hann',
+        window_doppler: str = 'hann'
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Same as compute_range_doppler but returns complex RD map
+        (needed by interference canceller).
+        """
+        M, N = beat_signal.shape
+
+        if window_range:
+            w_r = self._get_window(window_range, N)
+            beat_signal = beat_signal * w_r[np.newaxis, :]
+
+        range_fft = np.fft.fft(beat_signal, axis=1)
+
+        if window_doppler:
+            w_d = self._get_window(window_doppler, M)
+            range_fft = range_fft * w_d[:, np.newaxis]
+
+        rd_complex = np.fft.fftshift(np.fft.fft(range_fft, axis=0), axes=0)
+
+        range_axis = self._generate_range_axis()
+        velocity_axis = self._generate_velocity_axis()
+
+        return rd_complex, range_axis, velocity_axis
+
+    # ------------------------------------------------------------------
     def _generate_range_axis(self) -> np.ndarray:
         """
-        Generate range axis in meters.
-        
-        Returns:
-            Range values [N]
+        Range axis:  R[i] = i · ΔR,  ΔR = c/(2B)
+
+        Returns [N] in metres.
         """
-        freq_axis = np.fft.fftfreq(self.N, 1 / self.fs)
-        range_axis = (freq_axis * self.c) / (2 * self.chirp_rate)
-        
-        # Keep only positive ranges
-        range_axis = range_axis[:self.N]
-        
-        return range_axis
-    
+        return np.arange(self.N) * self.range_resolution
+
+    # ------------------------------------------------------------------
     def _generate_velocity_axis(self) -> np.ndarray:
         """
-        Generate velocity axis in m/s.
-        
-        Returns:
-            Velocity values [M] (centered around zero)
+        Velocity axis from Doppler FFT frequencies.
+
+        f_d[k] = fftfreq(M, T_PRI)  →  v[k] = (λ/2) · f_d[k]
+
+        After fftshift the axis is centred around zero.
+        Returns [M] in m/s.
         """
-        doppler_freq = np.fft.fftshift(np.fft.fftfreq(self.M, self.PRI))
-        velocity_axis = (doppler_freq * self.c) / (2 * self.fc)
-        
-        return velocity_axis
-    
+        fd = np.fft.fftshift(np.fft.fftfreq(self.M, self.PRI))
+        return (self.lambda_ / 2) * fd
+
+    # ------------------------------------------------------------------
     def _get_window(self, window_type: str, length: int) -> np.ndarray:
-        """
-        Get window function.
-        
-        Args:
-            window_type: Window type ('hann', 'hamming', 'blackman')
-            length: Window length
-            
-        Returns:
-            Window array
-        """
         if window_type == 'hann':
             return np.hanning(length)
         elif window_type == 'hamming':
@@ -134,68 +139,26 @@ class RangeDopplerProcessor:
             return np.blackman(length)
         else:
             return np.ones(length)
-    
+
+    # ------------------------------------------------------------------
     def detect_peaks(
         self,
         rd_map: np.ndarray,
         threshold_db: float = -20,
         num_peaks: int = 10
     ) -> np.ndarray:
-        """
-        Detect peaks in Range-Doppler map.
-        
-        Args:
-            rd_map: Range-Doppler map in dB
-            threshold_db: Detection threshold relative to max
-            num_peaks: Maximum number of peaks to return
-            
-        Returns:
-            Peak positions [num_detected, 2] with columns [doppler_idx, range_idx]
-        """
-        # Normalize to max
-        rd_normalized = rd_map - np.max(rd_map)
-        
-        # Find peaks above threshold
-        mask = rd_normalized > threshold_db
-        
-        # Get indices
-        doppler_idx, range_idx = np.where(mask)
-        values = rd_normalized[doppler_idx, range_idx]
-        
-        # Sort by magnitude
-        sorted_indices = np.argsort(values)[::-1]
-        
-        # Return top peaks
-        num_detected = min(num_peaks, len(sorted_indices))
-        peaks = np.column_stack([
-            doppler_idx[sorted_indices[:num_detected]],
-            range_idx[sorted_indices[:num_detected]]
-        ])
-        
-        return peaks
-    
+        """Detect peaks in RD map above threshold relative to max."""
+        rd_norm = rd_map - np.max(rd_map)
+        mask = rd_norm > threshold_db
+        d_idx, r_idx = np.where(mask)
+        values = rd_norm[d_idx, r_idx]
+        order = np.argsort(values)[::-1]
+        n_det = min(num_peaks, len(order))
+        return np.column_stack([d_idx[order[:n_det]], r_idx[order[:n_det]]])
+
+    # ------------------------------------------------------------------
     def extract_range_profile(self, rd_map: np.ndarray, doppler_idx: int) -> np.ndarray:
-        """
-        Extract range profile at specific Doppler bin.
-        
-        Args:
-            rd_map: Range-Doppler map
-            doppler_idx: Doppler bin index
-            
-        Returns:
-            Range profile [N]
-        """
         return rd_map[doppler_idx, :]
-    
+
     def extract_doppler_profile(self, rd_map: np.ndarray, range_idx: int) -> np.ndarray:
-        """
-        Extract Doppler profile at specific range bin.
-        
-        Args:
-            rd_map: Range-Doppler map
-            range_idx: Range bin index
-            
-        Returns:
-            Doppler profile [M]
-        """
         return rd_map[:, range_idx]

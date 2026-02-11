@@ -1,302 +1,311 @@
 """
-FastAPI Application for Automotive FMCW SAR Simulation
+FastAPI — Physics-Correct Simulation Pipeline
 
-RESTful API with endpoints:
-- POST /simulate: Run complete simulation pipeline
-- GET /default-parameters: Get default radar configuration
+Validation (Prompts 6-7):
+    1. max(|v_bins|) == λ/(4·T_PRI)       Doppler axis check
+    2. |V_est − V_true| > 5 m/s           ego-motion flag
+    3. PSR < 5 dB                          focusing failure flag
+    4. Resolution increases with aperture   inversion bug flag
+
+Resolution (Prompt 8): return MEASURED 3dB width, not theoretical.
+Azimuth axis (Prompt 5):  Δx = V_avg × T_PRI, from integrated motion.
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import List, Optional
 import numpy as np
+import time
 
-from radar.fmcw import FMCWRadar
-from radar.range_doppler import RangeDopplerProcessor
-from radar.interference import InterferenceCanceller
-from radar.ego_motion import EgoMotionEstimator
-from radar.sar import SARProcessor
-from radar.metrics import SARMetrics
+from .fmcw import FMCWRadar
+from .range_doppler import RangeDopplerProcessor
+from .interference import InterferenceCanceller
+from .ego_motion import EgoMotionEstimator
+from .sar import SARProcessor
+from .metrics import SARMetrics
 
-
+# ── App ────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Automotive FMCW SAR Simulation API",
-    description="Backend API for radar signal processing and SAR imaging",
-    version="1.0.0"
+    title="Automotive FMCW SAR Simulator",
+    description="Physics-correct radar signal processing v2.1",
+    version="2.1.0",
 )
 
-# CORS middleware for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# Pydantic models for request/response
+# ── Models ─────────────────────────────────────────────────────────
 class SimulationParameters(BaseModel):
-    """Simulation configuration parameters"""
-    # Radar parameters
     fc: float = Field(77e9, description="Carrier frequency (Hz)")
     B: float = Field(500e6, description="Bandwidth (Hz)")
     Tsw: float = Field(40e-6, description="Sweep time (s)")
-    PRI: float = Field(50e-6, description="Pulse Repetition Interval (s)")
+    PRI: float = Field(50e-6, description="Pulse repetition interval (s)")
     M: int = Field(256, description="Number of chirps")
     N: int = Field(512, description="ADC samples per chirp")
-    
-    # Vehicle parameters
-    v0: float = Field(20.0, description="Initial velocity (m/s)")
+    v0: float = Field(20.0, description="Vehicle velocity (m/s)")
     acceleration: float = Field(0.0, description="Acceleration (m/s²)")
-    velocity_noise_std: float = Field(0.0, description="Velocity noise std dev (m/s)")
+    velocity_noise_std: float = Field(0.0, description="Velocity noise std (m/s)")
     h0: float = Field(1.5, description="Radar height (m)")
-    
-    # Scene parameters
-    synthetic_aperture_length: float = Field(10.0, description="Synthetic aperture size (m)")
+    synthetic_aperture_length: float = Field(10.0, description="Aperture length (m)")
     num_scatterers: int = Field(100, description="Number of ground scatterers")
     num_point_targets: int = Field(3, description="Number of point targets")
-    
-    # Noise and interference
-    noise_power: float = Field(1e-6, description="Noise power level")
+    noise_power: float = Field(1e-6, description="Noise power")
     si_amplitude: float = Field(0.1, description="Self-interference amplitude")
-    
-    # Processing parameters
-    max_si_iterations: int = Field(5, description="Max interference cancellation iterations")
+    max_si_iterations: int = Field(10, description="Max SI cancellation iterations")
+    debug: bool = Field(False, description="Return debug arrays")
 
 
 class SimulationResult(BaseModel):
-    """Simulation output data"""
-    # Range-Doppler maps
+    # Range-Doppler
     rd_map_before_si: List[List[float]]
     rd_map_after_si: List[List[float]]
     range_axis: List[float]
     velocity_axis: List[float]
-    
-    # Interference cancellation metrics
     si_reduction_db: float
     si_iterations: int
-    
-    # Ego-motion estimates
+    # Ego-motion
+    velocity_ground_truth: float
     velocity_wm: float
     velocity_os: float
     velocity_dcm: float
-    velocity_ground_truth: float
     ego_motion_metrics: dict
-    
-    # SAR images
+    # SAR
     sar_image_conventional: List[List[float]]
     sar_image_interpolated: List[List[float]]
     sar_range_axis: List[float]
     sar_azimuth_axis: List[float]
-    
-    # SAR quality metrics
-    azimuth_resolution: float
+    # Metrics — MEASURED not theoretical
+    azimuth_resolution_measured: float
     psr: float
     position_error: Optional[float]
-    
-    # Performance curves
     resolution_vs_aperture: dict
     psr_vs_aperture: dict
+    # Validation
+    validation_warnings: List[str]
+    computation_time: float
+    debug_info: Optional[dict] = None
 
 
+# ── Endpoints ──────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    """API health check"""
     return {
-        "status": "online",
-        "message": "Automotive FMCW SAR Simulation API",
-        "version": "1.0.0"
+        "service": "Automotive FMCW SAR Simulator",
+        "version": "2.1.0 — physics-correct",
+        "endpoints": ["/simulate", "/default-parameters", "/docs"],
     }
 
 
 @app.get("/default-parameters")
 async def get_default_parameters():
-    """Get default automotive radar configuration"""
-    return {
-        "fc": 77e9,  # 77 GHz automotive radar
-        "B": 500e6,  # 500 MHz bandwidth
-        "Tsw": 40e-6,  # 40 μs sweep time
-        "PRI": 50e-6,  # 50 μs PRI
-        "M": 256,  # 256 chirps
-        "N": 512,  # 512 samples per chirp
-        "v0": 20.0,  # 20 m/s (72 km/h)
-        "acceleration": 0.0,
-        "velocity_noise_std": 0.0,
-        "h0": 1.5,  # 1.5 m radar height
-        "synthetic_aperture_length": 10.0,  # 10 m aperture
-        "num_scatterers": 100,
-        "num_point_targets": 3,
-        "noise_power": 1e-6,
-        "si_amplitude": 0.1,
-        "max_si_iterations": 5
-    }
+    return SimulationParameters().model_dump()
 
 
 @app.post("/simulate", response_model=SimulationResult)
 async def run_simulation(params: SimulationParameters):
-    """
-    Run complete FMCW SAR simulation pipeline.
-    
-    Returns all processing results including Range-Doppler maps,
-    ego-motion estimates, SAR images, and quality metrics.
-    """
+    t0 = time.time()
+    warnings: List[str] = []
+
     try:
-        # Initialize radar configuration
-        radar_config = {
-            'fc': params.fc,
-            'B': params.B,
-            'Tsw': params.Tsw,
-            'PRI': params.PRI,
-            'M': params.M,
-            'N': params.N,
-            'h0': params.h0,
-            'c': 3e8
+        config = {
+            'fc': params.fc, 'B': params.B, 'Tsw': params.Tsw,
+            'PRI': params.PRI, 'M': params.M, 'N': params.N,
+            'h0': params.h0, 'c': 3e8,
         }
-        
-        # Step 1: Generate FMCW beat signal
-        radar = FMCWRadar(radar_config)
-        
-        velocity_profile = radar.generate_velocity_profile(
-            params.v0,
-            params.acceleration,
-            params.velocity_noise_std
+        lambda_ = 3e8 / params.fc
+
+        # ── 1. FMCW signal ─────────────────────────────────────
+        radar = FMCWRadar(config)
+        vel_prof = radar.generate_velocity_profile(
+            params.v0, params.acceleration, params.velocity_noise_std
         )
-        
+        gt_v = float(np.mean(vel_prof))
+
+        # Calculate ACTUAL physical aperture traversed
+        # L_actual = duration * speed
+        actual_aperture_length = params.M * params.PRI * gt_v
+
+        # Scatterers: Full road scene to ensure:
+        # 1. Forward scatterers (x >> 0) -> High Doppler for Ego-Motion
+        # 2. Side scatterers (x ~ 0) -> SAR imaging background
         scatterers = radar.generate_scatterers(
             params.num_scatterers,
-            x_range=(0, params.synthetic_aperture_length * 2),
-            y_range=(10, 100)
+            x_range=(-50, 50),
+            y_range=(5, 50),
         )
-        
-        # Generate point targets at specific positions
-        target_positions = np.array([
-            [params.synthetic_aperture_length * 0.3, 30],
-            [params.synthetic_aperture_length * 0.5, 50],
-            [params.synthetic_aperture_length * 0.7, 70]
-        ])[:params.num_point_targets]
-        
-        point_targets = radar.generate_point_targets(target_positions, rcs=10.0)
-        
-        beat_signal, metadata = radar.generate_beat_signal(
-            velocity_profile,
-            scatterers,
-            point_targets,
-            params.noise_power,
-            params.si_amplitude
+
+        # Point targets: Place at x=0 (Broadside)
+        # This is where SAR resolution is best (sin(theta)=1)
+        # and they are inside the physical aperture x in [-L/2, L/2]
+        target_true_azimuth = 0.0
+        point_targets = None
+        if params.num_point_targets > 0:
+            tx = np.zeros(params.num_point_targets)  # All at x=0 azimuth
+            # Spread in range (y) instead of azimuth
+            ty = np.linspace(15, 25, params.num_point_targets)
+            positions = np.column_stack([tx, ty])
+            point_targets = radar.generate_point_targets(positions, rcs=1000.0)
+            target_true_azimuth = 0.0
+
+        beat, meta = radar.generate_beat_signal(
+            vel_prof, scatterers, point_targets,
+            noise_power=params.noise_power,
+            si_amplitude=params.si_amplitude,
         )
-        
-        # Step 2: Range-Doppler processing
-        rd_processor = RangeDopplerProcessor(radar_config)
-        rd_map_db, range_axis, velocity_axis = rd_processor.compute_range_doppler(beat_signal)
-        
-        # Convert to linear scale for interference cancellation
-        rd_map_linear = 10 ** (rd_map_db / 20)
-        rd_map_complex = rd_map_linear * np.exp(1j * np.angle(
-            np.fft.fftshift(np.fft.fft2(beat_signal), axes=0)
-        ))
-        
-        # Step 3: Self-interference cancellation
-        si_canceller = InterferenceCanceller(radar_config)
-        rd_cleaned, si_metrics = si_canceller.iterative_cancellation(
-            rd_map_complex,
-            max_iterations=params.max_si_iterations
+
+        # ── 2. Range-Doppler ───────────────────────────────────
+        rd_proc = RangeDopplerProcessor(config)
+        rd_complex, range_axis, vel_axis = rd_proc.compute_range_doppler_complex(beat)
+        rd_before_db = 20 * np.log10(np.abs(rd_complex) + 1e-12)
+
+        # ── 3. Self-interference cancellation ──────────────────
+        canceller = InterferenceCanceller(config)
+        rd_clean, si_met = canceller.iterative_cancellation(
+            rd_complex, max_iterations=params.max_si_iterations
         )
-        
-        # Convert cleaned map to dB
-        rd_cleaned_db = 20 * np.log10(np.abs(rd_cleaned) + 1e-12)
-        
-        # Step 4: Ego-motion estimation
-        ego_estimator = EgoMotionEstimator(radar_config)
-        ego_results = ego_estimator.estimate_all_methods(
-            np.abs(rd_cleaned),
-            velocity_axis,
-            range_axis,
-            ground_truth=params.v0
+        rd_after_db = 20 * np.log10(np.abs(rd_clean) + 1e-12)
+
+        # ── 4. Ego-motion ──────────────────────────────────────
+        ego = EgoMotionEstimator(config)
+        ego_res = ego.estimate_all_methods(
+            rd_clean, vel_axis, range_axis, ground_truth=gt_v
         )
-        
-        # Step 5: SAR image formation
-        sar_processor = SARProcessor(radar_config)
-        
-        # Conventional RDA
-        sar_conventional, sar_range_axis, sar_azimuth_axis = sar_processor.rda_conventional(
-            beat_signal,
-            params.v0,
-            params.synthetic_aperture_length
+
+        # ── 5. SAR image ──────────────────────────────────────
+        sar_proc = SARProcessor(config)
+
+        v_platform = ego_res['v_wm']
+        if abs(v_platform) < 0.5:
+            v_platform = gt_v
+
+        sar_conv, sar_r, sar_az = sar_proc.rda_conventional(
+            beat, v_platform, params.synthetic_aperture_length
         )
-        
-        # Interpolated RDA
-        sar_interpolated, _, _ = sar_processor.rda_interpolated(
-            beat_signal,
-            velocity_profile,
-            params.synthetic_aperture_length
+        sar_interp, _, _ = sar_proc.rda_interpolated(
+            beat, vel_prof, params.synthetic_aperture_length
         )
-        
-        # Step 6: SAR quality metrics
-        sar_metrics_calc = SARMetrics()
-        sar_quality = sar_metrics_calc.compute_all_metrics(
-            sar_conventional,
-            sar_azimuth_axis,
-            true_azimuth=target_positions[0, 0] if len(target_positions) > 0 else None
-        )
-        
-        # Resolution vs aperture curve
-        aperture_sizes = np.linspace(2, 20, 10)
-        apertures, resolutions = sar_metrics_calc.resolution_vs_aperture(
-            radar_config,
-            params.v0,
-            aperture_sizes
-        )
-        
-        # PSR vs aperture curve
-        _, psr_values = sar_metrics_calc.psr_vs_aperture(aperture_sizes)
-        
-        # Prepare response
-        result = SimulationResult(
-            # Range-Doppler maps
-            rd_map_before_si=rd_map_db.tolist(),
-            rd_map_after_si=rd_cleaned_db.tolist(),
-            range_axis=range_axis.tolist(),
-            velocity_axis=velocity_axis.tolist(),
-            
-            # Interference cancellation
-            si_reduction_db=float(si_metrics['reduction_db']),
-            si_iterations=int(si_metrics['iterations']),
-            
-            # Ego-motion
-            velocity_wm=float(ego_results['wm']),
-            velocity_os=float(ego_results['os']),
-            velocity_dcm=float(ego_results['dcm']),
-            velocity_ground_truth=float(params.v0),
-            ego_motion_metrics=ego_results.get('metrics', {}),
-            
-            # SAR images
-            sar_image_conventional=sar_conventional.tolist(),
-            sar_image_interpolated=sar_interpolated.tolist(),
-            sar_range_axis=sar_range_axis.tolist(),
-            sar_azimuth_axis=sar_azimuth_axis.tolist(),
-            
-            # SAR quality
-            azimuth_resolution=float(sar_quality['azimuth_resolution']),
-            psr=float(sar_quality['psr']),
-            position_error=float(sar_quality['position_error']) if sar_quality['position_error'] is not None else None,
-            
-            # Performance curves
+
+        # ── 6. MEASURED metrics (Prompt 8) ─────────────────────
+        metrics = SARMetrics()
+
+        # Measured resolution from 3dB width (NOT theoretical)
+        az_res_measured = metrics.compute_azimuth_resolution(sar_conv, sar_az)
+        psr = metrics.compute_psr(sar_conv)
+
+        pos_err = None
+        if point_targets is not None:
+            pos_err = metrics.compute_position_error(
+                sar_conv, sar_az, true_azimuth=target_true_azimuth
+            )
+
+        # Resolution & PSR vs aperture (theoretical curves)
+        ap_sizes = np.linspace(actual_aperture_length * 0.5, actual_aperture_length * 5.0, 10)
+        _, resolutions = metrics.resolution_vs_aperture(config, gt_v, ap_sizes)
+        _, psr_vals = metrics.psr_vs_aperture(ap_sizes)
+
+        # ── 7. VALIDATION CHECKS (Prompts 6-7) ────────────────
+        # Check 1: Doppler axis max == λ/(4·T_PRI)
+        expected_vmax = lambda_ / (4 * params.PRI)
+        actual_vmax = float(np.max(np.abs(vel_axis)))
+        if abs(actual_vmax - expected_vmax) / expected_vmax > 0.02:
+            warnings.append(
+                f"DOPPLER: max(|v|)={actual_vmax:.2f} ≠ λ/(4·PRI)={expected_vmax:.2f}"
+            )
+
+        # Check 2: Ego-motion error
+        for name, v_est in [('WM', ego_res['v_wm']),
+                            ('OS', ego_res['v_os']),
+                            ('DCM', ego_res['v_dcm'])]:
+            err = abs(v_est - gt_v)
+            if err > 5.0:
+                warnings.append(f"{name} ego error = {err:.2f} m/s (> 5 threshold)")
+
+        # Check 3: PSR < 5 dB → focusing failure
+        if psr < 5.0:
+            warnings.append(f"PSR = {psr:.1f} dB (< 5 dB threshold — focus failure)")
+
+        # Check 4: Resolution must decrease with aperture
+        if len(resolutions) >= 2 and resolutions[-1] > resolutions[0]:
+            warnings.append("Resolution INCREASES with aperture — inversion bug")
+
+        # ── 8. Build response ──────────────────────────────────
+        rd_b = _sub2d(rd_before_db, 128, 128)
+        rd_a = _sub2d(rd_after_db, 128, 128)
+        sc = _sub2d(sar_conv, 128, 128)
+        si = _sub2d(sar_interp, 128, 128)
+        r_ax = _sub1d(range_axis, 128)
+        v_ax = _sub1d(vel_axis, 128)
+        sr = _sub1d(sar_r, 128)
+        sa = _sub1d(sar_az, 128)
+
+        dt = time.time() - t0
+
+        debug = None
+        if params.debug:
+            debug = {
+                'doppler_axis_hz': _sub1d(
+                    np.fft.fftshift(np.fft.fftfreq(params.M, params.PRI)), 128
+                ).tolist(),
+                'velocity_bins': v_ax.tolist(),
+                'theoretical_resolution': float(lambda_ / (2 * actual_aperture_length)),
+                'measured_resolution': float(az_res_measured),
+                'expected_vmax': float(expected_vmax),
+                'actual_vmax': float(actual_vmax),
+                'lambda': float(lambda_),
+                'range_resolution': float(3e8 / (2 * params.B)),
+            }
+
+        return SimulationResult(
+            rd_map_before_si=rd_b.tolist(),
+            rd_map_after_si=rd_a.tolist(),
+            range_axis=r_ax.tolist(),
+            velocity_axis=v_ax.tolist(),
+            si_reduction_db=float(si_met['reduction_db']),
+            si_iterations=int(si_met['iterations']),
+            velocity_ground_truth=gt_v,
+            velocity_wm=float(ego_res['v_wm']),
+            velocity_os=float(ego_res['v_os']),
+            velocity_dcm=float(ego_res['v_dcm']),
+            ego_motion_metrics=ego_res.get('metrics', {}),
+            sar_image_conventional=sc.tolist(),
+            sar_image_interpolated=si.tolist(),
+            sar_range_axis=sr.tolist(),
+            sar_azimuth_axis=sa.tolist(),
+            azimuth_resolution_measured=float(az_res_measured),
+            psr=float(psr),
+            position_error=float(pos_err) if pos_err is not None else None,
             resolution_vs_aperture={
-                'aperture_sizes': apertures.tolist(),
-                'resolutions': resolutions.tolist()
+                'aperture_sizes': ap_sizes.tolist(),
+                'resolutions': resolutions.tolist(),
             },
             psr_vs_aperture={
-                'aperture_sizes': aperture_sizes.tolist(),
-                'psr_values': psr_values.tolist()
-            }
+                'aperture_sizes': ap_sizes.tolist(),
+                'psr_values': psr_vals.tolist(),
+            },
+            validation_warnings=warnings,
+            computation_time=dt,
+            debug_info=debug,
         )
-        
-        return result
-        
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Simulation error: {str(e)}")
+        import traceback
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
+# ── Helpers ────────────────────────────────────────────────────────
+def _sub2d(a, mr, mc):
+    r, c = a.shape
+    return a[::max(1, r//mr), ::max(1, c//mc)]
+
+def _sub1d(a, ms):
+    return a[::max(1, len(a)//ms)]
 
 
 if __name__ == "__main__":

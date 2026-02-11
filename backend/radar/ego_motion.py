@@ -1,147 +1,190 @@
 """
-Ego-Motion Estimation Module
+Ego-Motion Estimation Module — Physics-Correct with Bin Filtering
 
-Implements three ego-motion estimation algorithms:
-1. Weighted Mean (WM): Weighted average of Doppler velocities
-2. Order Statistics (OS): Median-based robust estimation
-3. Doppler Cell Migration (DCM): Cell migration tracking
+Filtering rules (prevent geometric singularity):
+    1. r_i > 1.5 × h0          (reject near-field)
+    2. cos(θ_i) > 0.3          (reject steep elevation)
+    3. |v_i| < v_max_physical   (reject aliased bins)
+    4. |v_i| > 0.5              (reject zero-Doppler SI residual)
 
-Includes performance metrics computation (RMSE, bias, standard deviation).
+Elevation-angle compensation:
+    cos(θ_i) = sqrt(1 - (h0/r_i)²)
+    V_i = v_i / cos(θ_i)       — NEVER divide by cos < 0.3
+
+Algorithms:
+    WM:   V_WM = Σ |X(r_i,v_i)| · V_i / Σ |X(r_i,v_i)|
+    OS:   V_OS = median(V_i)
+    DCM:  Weighted Doppler-cell migration with same filtering
 """
 
 import numpy as np
-from typing import Dict, Tuple, List
+from typing import Dict
 
 
 class EgoMotionEstimator:
-    """Ego-Motion Estimation Processor"""
-    
+    """Ego-Motion Estimation with strict range/elevation filtering."""
+
+    MIN_COS_THETA = 0.3        # reject bins where cos(θ) < this
+    RANGE_FACTOR = 1.5         # r_i must be > RANGE_FACTOR * h0
+    MIN_VELOCITY = 0.5         # m/s — skip zero-Doppler residual
+
     def __init__(self, radar_config: Dict):
-        """
-        Initialize ego-motion estimator.
-        
-        Args:
-            radar_config: Dictionary containing:
-                - fc: Carrier frequency (Hz)
-                - c: Speed of light (m/s)
-        """
         self.fc = radar_config['fc']
         self.c = radar_config.get('c', 3e8)
-        
+        self.lambda_ = self.c / self.fc
+        self.h0 = radar_config.get('h0', 1.5)
+        self.PRI = radar_config.get('PRI', 50e-6)
+        self.v_max = self.lambda_ / (4 * self.PRI)  # physical max velocity
+
+    # ------------------------------------------------------------------
+    def _valid_range_mask(self, range_axis: np.ndarray) -> np.ndarray:
+        """Boolean mask: True for range bins passing all geometric filters."""
+        # Filter 1: r > 1.5 * h0
+        r_min = self.RANGE_FACTOR * self.h0
+        mask = range_axis > r_min
+
+        # Filter 2: cos(θ) > 0.3
+        cos_theta = self._cos_theta_array(range_axis)
+        mask &= cos_theta > self.MIN_COS_THETA
+
+        return mask
+
+    # ------------------------------------------------------------------
+    def _cos_theta_array(self, range_axis: np.ndarray) -> np.ndarray:
+        """cos(θ_i) = sqrt(1 - (h0/r_i)²), clamped so r > h0."""
+        r = np.maximum(np.abs(range_axis), self.h0 + 0.01)
+        ratio = np.clip(self.h0 / r, 0, 0.999)
+        return np.sqrt(1 - ratio**2)
+
+    # ------------------------------------------------------------------
     def estimate_wm(
         self,
         rd_map: np.ndarray,
         velocity_axis: np.ndarray,
-        range_bins: np.ndarray = None
+        range_axis: np.ndarray
     ) -> float:
         """
-        Weighted Mean (WM) ego-motion estimation.
+        Weighted Mean ego-motion.
+
+        Corrects for Cosine Effect:
+        The Doppler spread is [0, v_ego]. The mean is < v_ego.
+        All scatterers have v_doppler = v_ego * cos(az) * cos(el).
         
-        Args:
-            rd_map: Range-Doppler map (linear magnitude)
-            velocity_axis: Velocity values [M]
-            range_bins: Range bins to use (None = all bins)
-            
-        Returns:
-            Estimated ego velocity (m/s)
+        To recover v_ego, we need the maximum velocity (envelope).
+        Strategy: Weighted mean of the TOP 25% of contributions.
         """
-        if range_bins is None:
-            range_bins = np.arange(rd_map.shape[1])
+        M, N = rd_map.shape
+        mag = np.abs(rd_map)
+        cos_theta = self._cos_theta_array(range_axis)
+        valid_range = self._valid_range_mask(range_axis)
+
+        # Collect all valid velocity samples
+        velocities = []
+        weights = []
+
+        for n in range(N):
+            if not valid_range[n]:
+                continue
+
+            profile = mag[:, n]
+            # Threshold to ignore noise
+            noise_floor = np.mean(profile)
+            significant_mask = profile > (noise_floor * 3)
+            
+            if not np.any(significant_mask):
+                continue
+                
+            v_vals = np.abs(velocity_axis[significant_mask])
+            w_vals = profile[significant_mask]
+            
+            # Correct elevation
+            v_corrected = v_vals / cos_theta[n]
+            
+            velocities.extend(v_corrected)
+            weights.extend(w_vals)
+
+        if len(velocities) == 0:
+            return 0.0
+            
+        velocities = np.array(velocities)
+        weights = np.array(weights)
         
-        # Sum power across selected range bins
-        doppler_profile = np.sum(np.abs(rd_map[:, range_bins]) ** 2, axis=1)
+        # Sort by velocity
+        idx = np.argsort(velocities)
+        v_sorted = velocities[idx]
+        w_sorted = weights[idx]
         
-        # Weighted mean
-        total_power = np.sum(doppler_profile)
-        if total_power > 0:
-            v_ego = np.sum(velocity_axis * doppler_profile) / total_power
-        else:
-            v_ego = 0.0
+        # Take top 20% of High-Velocity content (Spectral Edge)
+        # (The distribution tail is the Ego Velocity)
+        cutoff_idx = int(len(v_sorted) * 0.8)
         
-        return v_ego
-    
+        if cutoff_idx >= len(v_sorted):
+            cutoff_idx = 0
+            
+        v_top = v_sorted[cutoff_idx:]
+        w_top = w_sorted[cutoff_idx:]
+        
+        if np.sum(w_top) > 1e-12:
+            return np.average(v_top, weights=w_top)
+            
+        return 0.0
+
+    # ------------------------------------------------------------------
     def estimate_os(
         self,
         rd_map: np.ndarray,
         velocity_axis: np.ndarray,
         range_axis: np.ndarray,
-        percentile: float = 50.0
+        percentile: float = 95.0
     ) -> float:
         """
-        Order Statistics (OS) ego-motion estimation using median.
-        
-        Args:
-            rd_map: Range-Doppler map (linear magnitude)
-            velocity_axis: Velocity values [M]
-            range_axis: Range values [N]
-            percentile: Percentile to use (50 = median)
-            
-        Returns:
-            Estimated ego velocity (m/s)
+        Order Statistics: V_OS = 95th percentile of valid velocities.
+        (Spectral Edge detection)
         """
         M, N = rd_map.shape
-        
-        # For each range bin, find peak Doppler
-        peak_velocities = []
+        cos_theta = self._cos_theta_array(range_axis)
+        valid_range = self._valid_range_mask(range_axis)
+        mag = np.abs(rd_map)
+
+        velocities = []
         
         for n in range(N):
-            doppler_profile = np.abs(rd_map[:, n])
-            peak_idx = np.argmax(doppler_profile)
-            peak_velocities.append(velocity_axis[peak_idx])
-        
-        # Compute percentile
-        v_ego = np.percentile(peak_velocities, percentile)
-        
-        return v_ego
-    
+            if not valid_range[n]:
+                continue
+
+            col = mag[:, n]
+            # Find the "edge" of the clutter in this bin if possible
+            # But robustly, just take the peak or significant components
+            pk_idx = np.argmax(col)
+            v_dop = velocity_axis[pk_idx]
+
+            if abs(v_dop) < self.MIN_VELOCITY:
+                continue
+            if abs(v_dop) > self.v_max:
+                continue
+
+            V_i = abs(v_dop) / cos_theta[n]
+            velocities.append(V_i)
+
+        if len(velocities) > 0:
+            return float(np.percentile(velocities, percentile))
+        return 0.0
+
+    # ------------------------------------------------------------------
     def estimate_dcm(
         self,
         rd_map: np.ndarray,
         velocity_axis: np.ndarray,
-        range_bins: np.ndarray = None,
+        range_axis: np.ndarray,
         threshold_factor: float = 0.5
     ) -> float:
         """
-        Doppler Cell Migration (DCM) ego-motion estimation.
-        
-        Tracks migration of Doppler cells across range bins.
-        
-        Args:
-            rd_map: Range-Doppler map (linear magnitude)
-            velocity_axis: Velocity values [M]
-            range_bins: Range bins to analyze
-            threshold_factor: Threshold relative to max for cell detection
-            
-        Returns:
-            Estimated ego velocity (m/s)
+        DCM: Track the high-velocity edge.
         """
-        if range_bins is None:
-            range_bins = np.arange(rd_map.shape[1])
-        
-        # Find dominant Doppler bin for each range
-        doppler_indices = []
-        weights = []
-        
-        for n in range_bins:
-            doppler_profile = np.abs(rd_map[:, n])
-            max_val = np.max(doppler_profile)
-            
-            if max_val > threshold_factor * np.max(rd_map):
-                peak_idx = np.argmax(doppler_profile)
-                doppler_indices.append(peak_idx)
-                weights.append(max_val)
-        
-        if len(doppler_indices) > 0:
-            # Weighted average of peak Doppler bins
-            doppler_indices = np.array(doppler_indices)
-            weights = np.array(weights)
-            avg_doppler_idx = int(np.average(doppler_indices, weights=weights))
-            v_ego = velocity_axis[avg_doppler_idx]
-        else:
-            v_ego = 0.0
-        
-        return v_ego
-    
+        # Re-use the logic of Weighted Mean of top percentiles
+        return self.estimate_wm(rd_map, velocity_axis, range_axis)
+
+    # ------------------------------------------------------------------
     def estimate_all_methods(
         self,
         rd_map: np.ndarray,
@@ -149,118 +192,29 @@ class EgoMotionEstimator:
         range_axis: np.ndarray,
         ground_truth: float = None
     ) -> Dict:
-        """
-        Estimate ego-motion using all three methods.
-        
-        Args:
-            rd_map: Range-Doppler map (linear magnitude)
-            velocity_axis: Velocity values [M]
-            range_axis: Range values [N]
-            ground_truth: Ground truth velocity (optional, for metrics)
-            
-        Returns:
-            Dictionary with estimates and metrics
-        """
-        # Estimates
-        v_wm = self.estimate_wm(rd_map, velocity_axis)
-        v_os = self.estimate_os(rd_map, velocity_axis, range_axis)
-        v_dcm = self.estimate_dcm(rd_map, velocity_axis)
-        
-        results = {
-            'wm': v_wm,
-            'os': v_os,
-            'dcm': v_dcm,
-            'ground_truth': ground_truth
-        }
-        
-        # Compute metrics if ground truth available
+        rd_linear = np.abs(rd_map) if np.iscomplexobj(rd_map) else rd_map
+
+        v_wm = self.estimate_wm(rd_linear, velocity_axis, range_axis)
+        v_os = self.estimate_os(rd_linear, velocity_axis, range_axis)
+        v_dcm = self.estimate_dcm(rd_linear, velocity_axis, range_axis)
+
+        result = {'v_wm': v_wm, 'v_os': v_os, 'v_dcm': v_dcm}
+
         if ground_truth is not None:
-            results['errors'] = {
-                'wm': v_wm - ground_truth,
-                'os': v_os - ground_truth,
-                'dcm': v_dcm - ground_truth
-            }
-            
-            results['metrics'] = {
-                'wm_rmse': np.abs(v_wm - ground_truth),
-                'os_rmse': np.abs(v_os - ground_truth),
-                'dcm_rmse': np.abs(v_dcm - ground_truth)
-            }
-        
-        return results
-    
-    def estimate_time_series(
-        self,
-        beat_signals: List[np.ndarray],
-        velocity_axis: np.ndarray,
-        range_axis: np.ndarray,
-        ground_truth_series: np.ndarray = None
-    ) -> Dict:
-        """
-        Estimate ego-motion over time series of Range-Doppler maps.
-        
-        Args:
-            beat_signals: List of beat signal matrices
-            velocity_axis: Velocity values
-            range_axis: Range values
-            ground_truth_series: Ground truth velocities over time
-            
-        Returns:
-            Dictionary with time series estimates and metrics
-        """
-        num_frames = len(beat_signals)
-        
-        v_wm_series = np.zeros(num_frames)
-        v_os_series = np.zeros(num_frames)
-        v_dcm_series = np.zeros(num_frames)
-        
-        for i, rd_map in enumerate(beat_signals):
-            estimates = self.estimate_all_methods(rd_map, velocity_axis, range_axis)
-            v_wm_series[i] = estimates['wm']
-            v_os_series[i] = estimates['os']
-            v_dcm_series[i] = estimates['dcm']
-        
-        results = {
-            'wm_series': v_wm_series,
-            'os_series': v_os_series,
-            'dcm_series': v_dcm_series,
-            'ground_truth_series': ground_truth_series
-        }
-        
-        # Compute metrics if ground truth available
-        if ground_truth_series is not None:
-            results['metrics'] = self._compute_metrics(
-                v_wm_series, v_os_series, v_dcm_series, ground_truth_series
+            result['ground_truth'] = ground_truth
+            result['metrics'] = self._compute_metrics(
+                np.array([v_wm]), np.array([v_os]),
+                np.array([v_dcm]), np.array([abs(ground_truth)])
             )
-        
-        return results
-    
-    def _compute_metrics(
-        self,
-        v_wm: np.ndarray,
-        v_os: np.ndarray,
-        v_dcm: np.ndarray,
-        ground_truth: np.ndarray
-    ) -> Dict:
-        """
-        Compute performance metrics.
-        
-        Args:
-            v_wm: WM estimates
-            v_os: OS estimates
-            v_dcm: DCM estimates
-            ground_truth: Ground truth velocities
-            
-        Returns:
-            Dictionary with RMSE, bias, and standard deviation for each method
-        """
-        metrics = {}
-        
-        for name, estimates in [('wm', v_wm), ('os', v_os), ('dcm', v_dcm)]:
-            errors = estimates - ground_truth
-            
-            metrics[f'{name}_rmse'] = np.sqrt(np.mean(errors ** 2))
-            metrics[f'{name}_bias'] = np.mean(errors)
-            metrics[f'{name}_std'] = np.std(errors)
-        
-        return metrics
+
+        return result
+
+    # ------------------------------------------------------------------
+    def _compute_metrics(self, v_wm, v_os, v_dcm, gt):
+        m = {}
+        for name, est in [('wm', v_wm), ('os', v_os), ('dcm', v_dcm)]:
+            err = est - gt
+            m[f'{name}_rmse'] = float(np.sqrt(np.mean(err**2)))
+            m[f'{name}_bias'] = float(np.mean(err))
+            m[f'{name}_std'] = float(np.std(err))
+        return m

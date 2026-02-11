@@ -1,12 +1,20 @@
 """
-SAR Image Formation Module
+SAR Image Formation — Physics-Correct Phase-History Focusing
 
-Implements Range-Doppler Algorithm (RDA) for SAR imaging:
-- Range compression
-- Range Cell Migration Correction (RCMC)
-- Azimuth matched filtering
-- Conventional RDA (constant velocity assumption)
-- Interpolation-based RDA (nonuniform velocity)
+True SAR requires coherent phase accumulation:
+
+    Platform position:  x[m] = Σ V[m] × T_PRI
+    Instantaneous range: R[m] = sqrt((x[m]-x_t)² + R_c²)
+    Phase history:       φ[m] = 4π R[m] / λ
+    Azimuth matched filter: h[m] = exp(-j φ[m])
+
+A single point target must produce:
+    - A single sharp peak
+    - Symmetric sidelobes
+    - PSR > 10 dB
+
+Azimuth resolution: ρ_az = λ / (2L)  (theoretical)
+Measured resolution: 3 dB width from actual SAR image slice
 """
 
 import numpy as np
@@ -15,22 +23,9 @@ from scipy.interpolate import interp1d
 
 
 class SARProcessor:
-    """SAR Image Formation using Range-Doppler Algorithm"""
-    
+    """SAR Image Formation with Phase-History Matched Filtering."""
+
     def __init__(self, radar_config: Dict):
-        """
-        Initialize SAR processor.
-        
-        Args:
-            radar_config: Dictionary containing:
-                - fc: Carrier frequency (Hz)
-                - B: Bandwidth (Hz)
-                - lambda_: Wavelength (m)
-                - PRI: Pulse Repetition Interval (s)
-                - M: Number of chirps (azimuth samples)
-                - N: ADC samples per chirp
-                - c: Speed of light (m/s)
-        """
         self.fc = radar_config['fc']
         self.B = radar_config['B']
         self.PRI = radar_config['PRI']
@@ -38,7 +33,10 @@ class SARProcessor:
         self.N = radar_config['N']
         self.c = radar_config.get('c', 3e8)
         self.lambda_ = self.c / self.fc
-        
+        self.Tsw = radar_config.get('Tsw', 40e-6)
+        self.range_resolution = self.c / (2 * self.B)
+
+    # ------------------------------------------------------------------
     def rda_conventional(
         self,
         beat_signal: np.ndarray,
@@ -46,38 +44,29 @@ class SARProcessor:
         synthetic_aperture_length: float
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Conventional Range-Doppler Algorithm (constant velocity).
-        
-        Args:
-            beat_signal: Complex beat signal [M, N]
-            v_platform: Platform velocity (m/s)
-            synthetic_aperture_length: Synthetic aperture size (m)
-            
-        Returns:
-            sar_image: SAR image magnitude [M, N]
-            range_axis: Range axis (m)
-            azimuth_axis: Azimuth axis (m)
+        Phase-history based SAR focusing (constant velocity).
+
+        1. Range compression (FFT along fast-time)
+        2. For each range bin, apply azimuth matched filter
+           using phase history φ[m] = 4π R[m] / λ
         """
         M, N = beat_signal.shape
-        
-        # Step 1: Range compression (FFT along fast-time)
+
+        # Step 1: Range compression
         range_compressed = np.fft.fft(beat_signal, axis=1)
-        
-        # Step 2: Range Cell Migration Correction (RCMC)
-        rcmc_corrected = self._apply_rcmc(range_compressed, v_platform)
-        
-        # Step 3: Azimuth compression (matched filter)
-        sar_complex = self._azimuth_compression(rcmc_corrected, v_platform)
-        
-        # Magnitude image
+
+        # Step 2: Azimuth compression via phase-history matched filtering
+        sar_complex = self._phase_history_focus(
+            range_compressed, v_platform
+        )
+
         sar_image = np.abs(sar_complex)
-        
-        # Generate axes
         range_axis = self._generate_range_axis()
         azimuth_axis = self._generate_azimuth_axis(v_platform)
-        
+
         return sar_image, range_axis, azimuth_axis
-    
+
+    # ------------------------------------------------------------------
     def rda_interpolated(
         self,
         beat_signal: np.ndarray,
@@ -85,192 +74,177 @@ class SARProcessor:
         synthetic_aperture_length: float
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Interpolation-based RDA for nonuniform velocity.
-        
-        Args:
-            beat_signal: Complex beat signal [M, N]
-            velocity_profile: Velocity at each chirp [M]
-            synthetic_aperture_length: Synthetic aperture size (m)
-            
-        Returns:
-            sar_image: SAR image magnitude [M, N]
-            range_axis: Range axis (m)
-            azimuth_axis: Azimuth axis (m)
+        Phase-history SAR for non-uniform velocity.
+        Uses actual velocity profile for platform positions.
         """
         M, N = beat_signal.shape
-        
-        # Compute actual azimuth positions
-        azimuth_positions = np.cumsum(velocity_profile * self.PRI)
-        azimuth_positions = np.insert(azimuth_positions[:-1], 0, 0)
-        
-        # Create uniform azimuth grid
-        uniform_azimuth = np.linspace(
-            azimuth_positions[0],
-            azimuth_positions[-1],
-            M
+
+        # Range compression
+        range_compressed = np.fft.fft(beat_signal, axis=1)
+
+        # Platform positions from actual velocity profile
+        positions = np.concatenate(([0.0], np.cumsum(velocity_profile[:-1] * self.PRI)))
+
+        # Azimuth compression with actual positions
+        sar_complex = self._phase_history_focus_with_positions(
+            range_compressed, positions
         )
-        
-        # Interpolate beat signal to uniform grid
-        beat_uniform = np.zeros((M, N), dtype=complex)
-        
-        for n in range(N):
-            # Interpolate real and imaginary parts separately
-            interp_real = interp1d(
-                azimuth_positions,
-                beat_signal[:, n].real,
-                kind='cubic',
-                fill_value='extrapolate'
-            )
-            interp_imag = interp1d(
-                azimuth_positions,
-                beat_signal[:, n].imag,
-                kind='cubic',
-                fill_value='extrapolate'
-            )
-            
-            beat_uniform[:, n] = interp_real(uniform_azimuth) + 1j * interp_imag(uniform_azimuth)
-        
-        # Apply conventional RDA on uniform grid
-        v_avg = np.mean(velocity_profile)
-        sar_image, range_axis, _ = self.rda_conventional(
-            beat_uniform, v_avg, synthetic_aperture_length
-        )
-        
-        azimuth_axis = uniform_azimuth
-        
+
+        sar_image = np.abs(sar_complex)
+        v_mean = float(np.mean(velocity_profile))
+        range_axis = self._generate_range_axis()
+        azimuth_axis = self._generate_azimuth_axis_from_positions(positions)
+
         return sar_image, range_axis, azimuth_axis
-    
-    def _apply_rcmc(
+
+    # ------------------------------------------------------------------
+    def _phase_history_focus(
         self,
         range_compressed: np.ndarray,
         v_platform: float
     ) -> np.ndarray:
         """
-        Apply Range Cell Migration Correction.
-        
-        Args:
-            range_compressed: Range-compressed signal [M, N]
-            v_platform: Platform velocity (m/s)
-            
-        Returns:
-            RCMC-corrected signal [M, N]
+        Azimuth matched filtering using phase-history model.
+
+        For each range bin at range R_c:
+            Platform positions: x[m] = m × v × T_PRI
+            Instantaneous range: R[m] = sqrt(x[m]² + R_c²)
+                (target at azimuth centre, x_t = x_mid)
+            Phase: φ[m] = 4π R[m] / λ
+            Matched filter: h[m] = exp(-j φ[m])
         """
         M, N = range_compressed.shape
-        
-        # Azimuth frequency axis
-        f_azimuth = np.fft.fftfreq(M, self.PRI)
-        
-        # Range frequency axis
-        f_range = np.fft.fftfreq(N, 1 / (N / self.B))
-        
-        # Create 2D grids
-        F_azimuth, F_range = np.meshgrid(f_azimuth, f_range, indexing='ij')
-        
-        # Range cell migration (simplified model)
-        # Migration = lambda^2 * R * f_azimuth^2 / (8 * v^2)
-        # For simplicity, use approximate correction
-        
-        R_ref = self.c / (2 * self.B)  # Reference range
-        migration = (self.lambda_**2 * R_ref * F_azimuth**2) / (8 * v_platform**2)
-        
-        # Phase correction
-        phase_correction = np.exp(-1j * 2 * np.pi * F_range * migration)
-        
-        # Apply correction in 2D frequency domain
-        spectrum_2d = np.fft.fft2(range_compressed)
-        corrected_spectrum = spectrum_2d * np.fft.fftshift(phase_correction)
-        rcmc_corrected = np.fft.ifft2(corrected_spectrum)
-        
-        return rcmc_corrected
-    
-    def _azimuth_compression(
+
+        # Platform positions relative to mid-aperture
+        m_idx = np.arange(M, dtype=float)
+        x_platform = (m_idx - M/2) * v_platform * self.PRI  # [M] centred
+
+        sar_out = np.zeros_like(range_compressed)
+
+        for n in range(N):
+            R_c = max((n + 0.5) * self.range_resolution, 0.1)  # range to this bin
+
+            # Instantaneous slant range (target at azimuth centre x_t=0)
+            R_m = np.sqrt(x_platform**2 + R_c**2)  # [M]
+
+            # Phase history
+            phi = 4 * np.pi * R_m / self.lambda_  # [M]
+
+            # Match signal phase history (exp(jφ)) for correlation
+            h_m = np.exp(1j * phi)  # [M]
+
+            # Apply matched filter in azimuth (correlation = IFFT(FFT * conj(FFT_h)))
+            sig_fft = np.fft.fft(range_compressed[:, n])
+            h_fft = np.fft.fft(h_m)
+            sar_out[:, n] = np.fft.ifft(sig_fft * np.conj(h_fft))
+
+        return sar_out
+
+    # ------------------------------------------------------------------
+    def _phase_history_focus_with_positions(
         self,
-        signal: np.ndarray,
-        v_platform: float
+        range_compressed: np.ndarray,
+        positions: np.ndarray
     ) -> np.ndarray:
         """
-        Apply azimuth matched filtering.
-        
-        Args:
-            signal: Input signal [M, N]
-            v_platform: Platform velocity (m/s)
-            
-        Returns:
-            Azimuth-compressed signal [M, N]
+        Same as _phase_history_focus but uses actual platform positions
+        instead of assuming constant velocity.
         """
-        M, N = signal.shape
-        
-        # Azimuth matched filter (FFT along slow-time)
-        azimuth_spectrum = np.fft.fft(signal, axis=0)
-        
-        # Apply Doppler-dependent phase correction
-        f_azimuth = np.fft.fftfreq(M, self.PRI)
-        
-        # Matched filter (simplified)
-        # In practice, this would be range-dependent
-        R_ref = self.c / (2 * self.B)
-        
+        M, N = range_compressed.shape
+
+        # Centre positions around mid-aperture
+        x_mid = (positions[0] + positions[-1]) / 2
+        x_centered = positions - x_mid  # [M]
+
+        sar_out = np.zeros_like(range_compressed)
+
         for n in range(N):
-            phase_correction = np.exp(
-                1j * np.pi * self.lambda_ * R_ref * f_azimuth**2 / v_platform**2
-            )
-            azimuth_spectrum[:, n] *= phase_correction
-        
-        # Inverse FFT
-        compressed = np.fft.ifft(azimuth_spectrum, axis=0)
-        
-        return compressed
-    
+            R_c = max((n + 0.5) * self.range_resolution, 0.1)
+
+            R_m = np.sqrt(x_centered**2 + R_c**2)
+            phi = 4 * np.pi * R_m / self.lambda_
+            h_m = np.exp(1j * phi)
+
+            sig_fft = np.fft.fft(range_compressed[:, n])
+            h_fft = np.fft.fft(h_m)
+            sar_out[:, n] = np.fft.ifft(sig_fft * np.conj(h_fft))
+
+        return sar_out
+
+    # ------------------------------------------------------------------
     def _generate_range_axis(self) -> np.ndarray:
-        """Generate range axis in meters."""
-        freq_axis = np.fft.fftfreq(self.N, 1 / (self.N / self.B))
-        range_axis = (freq_axis * self.c) / (2 * self.B)
-        return range_axis[:self.N]
-    
+        """R[i] = i × ΔR"""
+        return np.arange(self.N) * self.range_resolution
+
     def _generate_azimuth_axis(self, v_platform: float) -> np.ndarray:
-        """Generate azimuth axis in meters."""
-        azimuth_axis = np.arange(self.M) * v_platform * self.PRI
-        return azimuth_axis
-    
-    def compute_resolution(
+        """Azimuth axis: Δx = V_avg × T_PRI, centred."""
+        x = np.arange(self.M) * v_platform * self.PRI
+        return x - np.mean(x)  # centre around 0
+
+    def _generate_azimuth_axis_from_positions(
+        self, positions: np.ndarray
+    ) -> np.ndarray:
+        """Azimuth axis from integrated positions, centred."""
+        return positions - np.mean(positions)
+
+    # ------------------------------------------------------------------
+    def compute_measured_resolution(
         self,
         sar_image: np.ndarray,
         azimuth_axis: np.ndarray,
-        target_azimuth: float
+        target_range_idx: int = None
     ) -> float:
         """
-        Compute azimuth resolution (3 dB width).
-        
-        Args:
-            sar_image: SAR image
-            azimuth_axis: Azimuth positions (m)
-            target_azimuth: Azimuth position of target (m)
-            
-        Returns:
-            Azimuth resolution (m)
+        MEASURED azimuth resolution: 3 dB width from SAR image.
+        NOT the theoretical ρ = λ/(2L).
+
+        1. Extract azimuth slice at target range
+        2. Find peak
+        3. Find width where amplitude = peak / √2
+        4. Return width in metres
         """
-        # Find target position
-        target_idx = np.argmin(np.abs(azimuth_axis - target_azimuth))
-        
-        # Extract azimuth profile (sum over range)
-        azimuth_profile = np.sum(sar_image, axis=1)
-        
-        # Normalize
-        azimuth_profile = azimuth_profile / np.max(azimuth_profile)
-        
-        # Find 3 dB points (-3 dB = 0.707 in linear scale)
-        threshold = 0.707
-        
-        # Find left and right 3 dB points
-        left_idx = target_idx
-        while left_idx > 0 and azimuth_profile[left_idx] > threshold:
-            left_idx -= 1
-        
-        right_idx = target_idx
-        while right_idx < len(azimuth_profile) - 1 and azimuth_profile[right_idx] > threshold:
-            right_idx += 1
-        
-        # Resolution is width between 3 dB points
-        resolution = azimuth_axis[right_idx] - azimuth_axis[left_idx]
-        
-        return resolution
+        if target_range_idx is None:
+            target_range_idx = np.argmax(np.max(sar_image, axis=0))
+
+        profile = sar_image[:, target_range_idx]
+        peak_idx = np.argmax(profile)
+        peak_val = profile[peak_idx]
+
+        if peak_val < 1e-12:
+            return float('inf')
+
+        threshold = peak_val / np.sqrt(2)  # -3 dB
+
+        # Walk left from peak
+        left = peak_idx
+        while left > 0 and profile[left] > threshold:
+            left -= 1
+
+        # Walk right from peak
+        right = peak_idx
+        while right < len(profile) - 1 and profile[right] > threshold:
+            right += 1
+
+        # Sub-bin interpolation
+        if left < peak_idx and right > peak_idx and len(azimuth_axis) > right:
+            left_pos = self._interp_crossing(
+                azimuth_axis[left], azimuth_axis[min(left+1, len(azimuth_axis)-1)],
+                profile[left], profile[min(left+1, len(profile)-1)],
+                threshold
+            )
+            right_pos = self._interp_crossing(
+                azimuth_axis[max(right-1, 0)], azimuth_axis[right],
+                profile[max(right-1, 0)], profile[right],
+                threshold
+            )
+            return abs(right_pos - left_pos)
+
+        return abs(azimuth_axis[right] - azimuth_axis[left])
+
+    # ------------------------------------------------------------------
+    def _interp_crossing(self, x0, x1, y0, y1, level):
+        """Linear interpolation for threshold crossing."""
+        if abs(y1 - y0) < 1e-15:
+            return (x0 + x1) / 2
+        t = (level - y0) / (y1 - y0)
+        return x0 + t * (x1 - x0)

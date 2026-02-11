@@ -1,0 +1,16 @@
+=== ROUND 2 PHYSICS VALIDATION ===
+GT=20.0  WM=18.41  OS=18.71  DCM=18.41
+WM_err=1.59  OS_err=1.29  DCM_err=1.59
+SI reduction: 8.7 dB (target >=15)
+SI iterations: 10
+PSR: 0.3 dB (target >10)
+Measured resolution: 0.119886 m
+Position error: 0.039121984782875596
+Computation time: 0.22 s
+Res@2m=0.030438  Res@20m=0.003044
+Res decreases: True
+Warnings: [
+  "PSR = 0.3 dB (< 5 dB threshold \u2014 focus failure)"
+]
+TheoRes=0.015219  MeasRes=0.119886
+vmax: actual=19.48  expected=19.48
